@@ -16,6 +16,7 @@ from datetime import datetime
 PLUGIN_ID = "fb-message-guardian"
 SCAN_BIN = "/usr/local/bin/ob-plugin-fb-message-guardian-scan"
 SEND_BIN = "/usr/local/bin/ob-plugin-fb-message-guardian-send"
+API_SCAN_BIN = "/usr/local/bin/ob-plugin-fb-message-guardian-api-scan"
 SETTINGS_PATH = os.path.expanduser("~/.config/open-bot/plugin-%s.json" % PLUGIN_ID)
 STATE_PATH = os.path.expanduser("~/.open-bot/%s/state.json" % PLUGIN_ID)
 VNC_DIR = os.path.expanduser("~/.open-bot/vnc")
@@ -88,7 +89,7 @@ def page_alive(sid):
 def notify(title, body):
     sh(["ob-plugin", "notify", PLUGIN_ID, title, body])
 
-def queue_pending(st, sender, plan, keyword_matched, template_text, pkey=""):
+def queue_pending(st, sender, plan, keyword_matched, template_text, pkey="", msg=None):
     if open_duplicate(st, sender, pkey):
         return None
     pid = "p-" + os.urandom(2).hex()
@@ -96,6 +97,9 @@ def queue_pending(st, sender, plan, keyword_matched, template_text, pkey=""):
     entry = {"id": pid, "sender": sender, "text": "" if needs_ai else template_text,
              "status": "await_ai" if needs_ai else "await_approval",
              "plan": plan, "pkey": pkey, "created": datetime.now().isoformat(timespec="seconds")}
+    if msg and msg.get("channel") == "api":  # l'envoi de ce brouillard partira par l'API Page
+        entry.update({"channel": "api", "psid": msg.get("psid"),
+                      "window_open": bool(msg.get("window_open"))})
     st["pending"].append(entry)
     save_state(st)
     return entry
@@ -134,7 +138,11 @@ def act(scan, session, cfg, st):
             done.append("notify:%s" % sender)
         elif action.startswith("send:template"):
             text = (msg.get("text") or template).replace("{expediteur}", sender.split()[0])
-            r = sh([SEND_BIN, "--session", session, "--to", sender, "--text", text])
+            if msg.get("channel") == "api":  # envoi via l'API officielle Page, sans écran
+                r = sh([SEND_BIN, "--session", session or "", "--psid", msg.get("psid") or "",
+                        "--to", sender, "--text", text])
+            else:
+                r = sh([SEND_BIN, "--session", session, "--to", sender, "--text", text])
             outj = {}
             try:
                 outj = json.loads((r.stdout or "").strip().splitlines()[-1]) if r and r.stdout else {}
@@ -143,7 +151,7 @@ def act(scan, session, cfg, st):
             if outj.get("status") == "sent":
                 done.append("sent:%s" % sender)
             else:
-                entry = queue_pending(st, sender, "draft", True, text, pkey)
+                entry = queue_pending(st, sender, "draft", True, text, pkey, msg)
                 if entry:
                     notify("Réponse en attente de ton oui",
                            "Brouillon %s pour %s : « %s » (envoi refusé : %s)"
@@ -152,7 +160,7 @@ def act(scan, session, cfg, st):
                 else:
                     done.append("dedup:%s" % sender)
         elif action == "send:ai":
-            entry = queue_pending(st, sender, "send:ai", False, "", pkey)
+            entry = queue_pending(st, sender, "send:ai", False, "", pkey, msg)
             if entry:
                 notify("Message Facebook — l'IA prépare une réponse",
                        "%s : %s (file %s)" % (sender, msg["preview"][:100], entry["id"]))
@@ -162,9 +170,10 @@ def act(scan, session, cfg, st):
         elif action == "draft":
             rtext = msg.get("text")
             if rtext:  # réponse fixe d'une règle : brouillon directement approvable
-                entry = queue_pending(st, sender, "draft", True, rtext, pkey)
+                entry = queue_pending(st, sender, "draft", True, rtext, pkey, msg)
             else:
-                entry = queue_pending(st, sender, "draft", bool(msg.get("matched_keyword")), template, pkey)
+                entry = queue_pending(st, sender, "draft", bool(msg.get("matched_keyword")),
+                                      template, pkey, msg)
             if entry:
                 if entry["status"] == "await_ai":
                     notify("Message Facebook — l'IA prépare une réponse",
@@ -227,13 +236,38 @@ def wake_agent(st, cfg, session, scan):
         senders = ", ".join(sorted({(e.get("sender") or "?").split()[0] for e in wakeable}))
         photos = sum(1 for e in wakeable if e.get("task") == "route_photo")
         suffix = " dont %d photo(s) à router vers un projet" % photos if photos else ""
-        print("%s Gardien FB : %d tâche(s) IA en attente (%s)%s. Session d'écran : %s."
+        print("%s Gardien FB : %d tâche(s) IA en attente (%s)%s. Canal : %s."
               % (MARKER, len(wakeable), senders, suffix, session))
     if dom_wake:
         print("%s Gardien FB : scan=dom_changed (plus aucune conversation lisible) sur la "
               "session %s : Facebook a probablement changé son DOM. Diagnostique une fois "
               "avec ob-page --session %s read et répare parse_rows/parse_row du scan si tu "
               "peux, sinon rapporte." % (MARKER, session, session))
+
+def dom_pass(cfg, st, seconds):
+    """Une passe du canal DOM (Messenger personnel). Retourne (status, session, scan)."""
+    session = resolve_session(cfg, st)
+    if not session:
+        return "no_session", None, None
+    p = sh([SCAN_BIN, "--session", session, "--interval-override-seconds", str(seconds)])
+    if not p or not p.stdout:
+        return "no_output", session, None
+    try:
+        scan = json.loads(p.stdout.strip().splitlines()[-1])
+    except Exception:
+        return "unreadable", session, None
+    return scan.get("status"), session, scan
+
+def api_pass(cfg, st, seconds):
+    """Une passe du canal API officielle (messages de la Page). Retourne (status, scan)."""
+    p = sh([API_SCAN_BIN, "--interval-override-seconds", str(seconds)])
+    if not p or not p.stdout:
+        return "no_output", None
+    try:
+        scan = json.loads(p.stdout.strip().splitlines()[-1])
+    except Exception:
+        return "unreadable", None
+    return scan.get("status"), scan
 
 def main():
     ap = argparse.ArgumentParser()
@@ -242,36 +276,56 @@ def main():
     cfg = settings()
     if cfg.get("watcher_enabled", "true") != "true":
         print("watcher désactivé"); return
+    source = (cfg.get("source", "dom") or "dom")
     st = state()
-    session = resolve_session(cfg, st)
-    if not session:
-        print("aucune session d'écran vivante"); return
-    p = sh([SCAN_BIN, "--session", session,
-            "--interval-override-seconds", str(args.interval_seconds)])
-    if not p or not p.stdout:
-        print("scan sans réponse"); return
-    try:
-        scan = json.loads(p.stdout.strip().splitlines()[-1])
-    except Exception:
-        print("scan illisible"); return
-    st = state()  # recharger : le scan (sous-processus) a pu mettre à jour last_scan/conversations
-    status = scan.get("status")
-    if status == "too_soon":
-        print("rien"); return
-    if status == "ok":
-        done = act(scan, session, cfg, st)
-        ai = pending_ai(st)
-        if not done and not ai:
-            print("rien"); return
-        print("actions: " + (", ".join(done) or "aucune") +
-              (" | %d en file IA" % len(ai) if ai else ""))
-        wake_agent(st, cfg, session, scan)
-        return
-    if status == "dom_changed":
-        print("scan: dom_changed")
-        wake_agent(st, cfg, session, scan)
-        return
-    print("scan: %s" % status)
+    lines = []
+
+    # — Canal DOM (Messenger personnel, via l'écran) —
+    if source in ("dom", "dom+api"):
+        status, session, scan = dom_pass(cfg, st, args.interval_seconds)
+        if status == "ok":
+            st = state()  # recharger : le scan (sous-processus) a pu mettre à jour l'état
+            done = act(scan, session, cfg, st)
+            ai = pending_ai(st)
+            lines.append("dom: " + ((", ".join(done) or "aucune") if (done or ai) else "rien"))
+            if done or ai:
+                wake_agent(st, cfg, "écran %s" % session, scan)
+        elif status == "too_soon":
+            pass
+        elif status == "dom_changed":
+            lines.append("dom: dom_changed")
+            wake_agent(st, cfg, session, scan)
+        elif status == "no_session":
+            lines.append("dom: aucune session d'écran vivante")
+        else:
+            lines.append("dom: %s" % status)
+
+    # — Canal API officielle Meta (messages de la Page, sans écran) —
+    if source in ("api", "dom+api"):
+        status, scan = api_pass(cfg, st, args.interval_seconds)
+        if status == "ok":
+            st = state()  # recharger : l'api_scan (sous-processus) a pu marquer api_seen
+            done = act(scan, None, cfg, st)
+            ai = pending_ai(st)
+            lines.append("api: " + ((", ".join(done) or "aucune") if (done or ai) else "rien"))
+            if done or ai:
+                wake_agent(st, cfg, "API Page", scan)
+        elif status == "too_soon":
+            pass
+        elif status in ("unconfigured", "api_error"):
+            w = st.setdefault("watcher", {})
+            today = datetime.now().strftime("%Y-%m-%d")
+            if w.get("api_diag_notified_on") != today:  # 1 diagnostic/jour max
+                w["api_diag_notified_on"] = today
+                save_state(st)
+                lines.append("api: %s — %s" % (status, (scan or {}).get("detail", "")))
+                print("%s Gardien FB : source api en échec (%s) : %s. Vérifie fb_page_id / "
+                      "fb_page_token (réglages du plugin) et les permissions du token."
+                      % (MARKER, status, (scan or {}).get("detail", "")))
+        else:
+            lines.append("api: %s" % status)
+
+    print(" | ".join(lines) if lines else "rien")
 
 if __name__ == "__main__":
     main()

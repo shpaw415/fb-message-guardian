@@ -141,6 +141,33 @@ dures : heures actives, plafond quotidien, mode d'envoi et liste blanche s'appli
 
 ---
 
+## 2-ter — Le canal API officielle Meta (messages de la Page, marketplace v0.2.0)
+
+Depuis la v0.2.0, le gardien a **deux canaux** qui alimentent la même file :
+
+| | Canal DOM (historique) | Canal API officielle (v0.2.0) |
+|---|---|---|
+| Périmètre | Messenger **personnel** | Messages de la **Page Facebook** |
+| Lecture | navigateur (messenger.com, DOM) | Graph API `/{page}/conversations` |
+| Envoi | composer via pixels (ob-vnc) | `POST /{page}/messages` |
+| Écran requis | oui | **non** (fonctionne navigateur fermé) |
+| Dédoublonnage | aperçu normalisé | id de message Meta (exact) |
+| Limite Meta | changements de DOM | fenêtre de réponse de 24 h |
+
+- L'API officielle ne couvre QUE les messages d'une Page : les MP personnels restent au
+  canal DOM, c'est une limite de Meta, pas du plugin.
+- Réglages : `source` (dom / api / dom+api), `fb_page_id`, `fb_page_token` (secret),
+  `api_graph_version`. Les mêmes portes s'appliquent (heures, plafond, mode d'envoi,
+  liste blanche, carnet de règles) et les brouillons s'approuvent pareil (« envoie p-XXXX ») —
+  le send route tout seul vers l'API quand l'entrée vient du canal api.
+- Au-delà de 24 h sans réponse sur un fil api, Meta refuse l'envoi : le send le rapporte
+  proprement (« fenêtre de 24 h fermée »).
+- Montage du token : app sur developers.facebook.com + produit Messenger, token de Page
+  avec `pages_messaging` + `pages_read_engagement` (voir CONFIG.md livré avec le plugin,
+  imprimable par `ob-plugin guide fb-message-guardian`).
+
+---
+
 ## 3. Les statuts du scan
 
 | Statut | Signification | Le cycle fait quoi |
@@ -171,6 +198,10 @@ dures : heures actives, plafond quotidien, mode d'envoi et liste blanche s'appli
 | `ai_persona` | (vide) | persona qui rédige (vide = modèle du bureau) |
 | `watcher_enabled` | true | veille scriptée toutes les ~3 min (0 token au repos) |
 | `screen_session` | (vide) | id d'écran fixe pour la veille (vide = auto-détection) |
+| `source` | dom | canal surveillé : dom / api / dom+api (§2-ter) |
+| `fb_page_id` | (vide) | id de la Page pour le canal API |
+| `fb_page_token` | (vide, secret) | token d'accès Page (pages_messaging + pages_read_engagement) |
+| `api_graph_version` | v21.0 | version de l'API Graph Meta |
 
 ---
 
@@ -179,6 +210,9 @@ dures : heures actives, plafond quotidien, mode d'envoi et liste blanche s'appli
 ```sh
 # Scan immédiat + plan (S = id d'écran du fil)
 ob-plugin-fb-message-guardian-scan --session S --force
+
+# Scan du canal API officielle (messages de la Page, aucun écran requis)
+ob-plugin-fb-message-guardian-api-scan --force
 
 # Lire les derniers messages d'un fil (contexte pour rédiger)
 ob-plugin-fb-message-guardian-scan --session S --thread "Nom"
@@ -191,6 +225,9 @@ ob-plugin-fb-message-guardian-send --session S --pending p-XXXX
 # Envoi direct demandé explicitement par toi (contourne mode/liste blanche,
 # jamais le plafond ni les heures… sauf force explicite = tu es le patron)
 ob-plugin-fb-message-guardian-send --session S --to "Nom" --text "..." --force
+
+# Envoi direct par le canal API Page (PSID de l'entrée, aucune session requise)
+ob-plugin-fb-message-guardian-send --psid PSID --to "Nom" --text "..."
 
 # La personnalité des réponses : carnet de règles
 ob-plugin-fb-message-guardian-rules --list
@@ -240,5 +277,14 @@ tu parles du plugin dans un fil).
 ```sh
 ob-cron add --name fb-guardian-watcher \
   --script "ob-plugin-fb-message-guardian-watch" --run auto --every 180 \
-  --message "Tu es le cycle IA du gardien Facebook (plugin fb-message-guardian), réveillé par le watcher scripté SEULEMENT s'il y a du travail : réponses IA en attente ou scan dom_changed. La ligne [cron-agent] donne la session d'écran <SESSION> et l'état. Passe unique, conclus en 2-3 lignes maximum : 1) ob-plugin-fb-message-guardian-queue --list ; 2) pour chaque entrée status=await_ai : contexte du fil via ob-plugin-fb-message-guardian-scan --session <SESSION> --thread \"<sender>\", rédige une réponse courte et professionnelle en français ; 3) si plan=send:ai → ob-plugin-fb-message-guardian-send --session <SESSION> --pending <id> --force ; sinon (plan=draft) → écris le texte rédigé dans l'entrée (~/.open-bot/fb-message-guardian/state.json, status=await_approval) et notifie Justin : brouillon <id> pour <sender> — « <réponse> » (il approuve par « envoie <id> »). dom_changed → diagnostique une fois avec ob-page --session <SESSION> read, répare parse_rows/parse_row du scan si possible, sinon rapporte. Garde-fous : jamais de mot de passe, jamais deux réponses au même message, jamais d'envoi hors des portes du plugin, pas de boucle, une seule passe."
+  --message "Tu es le cycle IA du gardien Facebook (plugin fb-message-guardian), réveillé par le watcher scripté SEULEMENT s'il y a du travail : réponses IA en attente ou un diagnostic. La ligne [cron-agent] donne le canal (« écran <SESSION> » = Messenger personnel, « API Page » = messages de la Page via l'API officielle) et l'état. Passe unique, conclus en 2-3 lignes maximum : 1) ob-plugin-fb-message-guardian-queue --list ; 2) pour chaque entrée status=await_ai : canal écran → contexte du fil via ob-plugin-fb-message-guardian-scan --session <SESSION> --thread \"<sender>\" ; canal API → contexte via les messages de l'entrée (preview) et le Graph API si besoin — l'entrée porte psid et window_open, et son envoi se fait par ob-plugin-fb-message-guardian-send --pending <id> (la fenêtre de 24 h de Meta est une porte dure). Rédige une réponse courte et professionnelle dans la langue du message reçu ; 3) si plan=send:ai → ob-plugin-fb-message-guardian-send --pending <id> (--session <SESSION> seulement pour le canal écran, --force si l'entrée le demande) ; sinon (plan=draft) → écris le texte rédigé dans l'entrée via ob-plugin-fb-message-guardian-queue --set-text <id> \"<réponse>\" et notifie Justin : brouillon <id> pour <sender> — « <réponse> » (il approuve par « envoie <id> »). dom_changed → diagnostique une fois avec ob-page --session <SESSION> read, répare parse_rows/parse_row du scan si possible, sinon rapporte. api en échec (unconfigured/api_error) → vérifie fb_page_id/fb_page_token dans les réglages du plugin et rapporte en une ligne. Garde-fous : jamais de mot de passe, jamais deux réponses au même message, jamais d'envoi hors des portes du plugin (fenêtre 24 h Meta incluse), messages hors règles ignorés en silence (queue --done), pas de boucle, une seule passe."
 ```
+
+## 8. Stress-test du canal API
+
+Le harnais vit dans le repo : `tests/fbmock.py` (mock du Graph API Meta : 6 conversations
+couvrant les cas normaux, unicode, sans nom, sans messages, mode erreur 190/10) et
+`tests/stress_fbguard.py` (28 vérifications : config manquante, plan, dédoublonnage,
+watch + file, fenêtre 24 h, envoi api, échec token, anti-boucle du diagnostic). Il
+sauvegarde et restaure réglages + état. Couture de test : env `FBGUARD_GRAPH_BASE`
+remplace https://graph.facebook.com dans api-scan et send.

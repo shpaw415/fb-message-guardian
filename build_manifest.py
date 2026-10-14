@@ -11,18 +11,44 @@ def tool(name, path):
 with open(os.path.join(BASE, "open-bot.plugin.json"), encoding="utf-8") as f:
     m = json.load(f)
 
-# Version stable : première publication marketplace.
-m["version"] = "0.1.0"
+# Version 0.2.0 : ajout du canal API officielle Meta (messages de la Page).
+m["version"] = "0.2.0"
 m["configs"][0]["label"] = ("Mode de réponse : hybride (modèle si mot-clé, IA sinon), "
                             "auto (modèles + notifications) ou ia (tout rédigé par l'IA)")
 m["tools"] = [
     tool("scan", "tools/scan.py"),
+    tool("api-scan", "tools/api_scan.py"),
     tool("send", "tools/send.py"),
     tool("queue", "tools/queue.py"),
     tool("watch", "tools/watch.py"),
     tool("rules", "tools/rules.py"),
 ]
-m["configs"].extend([
+extras = [
+    {
+        "key": "source",
+        "label": "Source : dom (MP perso via le navigateur), api (Page via l'API officielle Meta) ou dom+api (les deux)",
+        "def": "dom",
+        "type": "enum",
+        "options": ["dom", "api", "dom+api"]
+    },
+    {
+        "key": "fb_page_id",
+        "label": "Id de la Page Facebook à surveiller via l'API (vide = canal api inactif)",
+        "def": "",
+        "type": "string"
+    },
+    {
+        "key": "fb_page_token",
+        "label": "Token d'accès Page (secret) pour l'API Graph Meta — permissions pages_messaging et pages_read_engagement",
+        "def": "",
+        "type": "secret"
+    },
+    {
+        "key": "api_graph_version",
+        "label": "Version de l'API Graph Meta (ne changer que si Meta déprécie la version par défaut)",
+        "def": "v21.0",
+        "type": "string"
+    },
     {
         "key": "watcher_enabled",
         "label": "Veille scriptée active : scan toutes les ~3 min sans agent, réponses modèles instantanées (zéro token au repos)",
@@ -35,7 +61,9 @@ m["configs"].extend([
         "def": "",
         "type": "string"
     },
-])
+]
+m["configs"] = [c for c in m["configs"] if c["key"] not in {x["key"] for x in extras}]
+m["configs"].extend(extras)
 # Persona installée avec le plugin : sélectionnable à la création d'un fil pour gérer
 # le gardien (règles, file, diagnostics) dans la voix voulue par Justin.
 m["personas"] = [{
@@ -64,19 +92,33 @@ m["cron"] = []
 
 m["skills"][0]["body"] = """# fb-message-guardian
 
-Gardien de boîte Facebook Messenger. Quatre outils : `ob-plugin-fb-message-guardian-scan`,
-`-send`, `-queue`, `-watch` (tous exigent `--session <id d'écran du fil>`, sauf watch).
+Gardien de boîte Facebook Messenger. Cinq outils : `ob-plugin-fb-message-guardian-scan`,
+`-api-scan`, `-send`, `-queue`, `-watch` (scan et send exigent `--session <id d'écran>`
+pour le canal DOM ; le canal API n'a besoin d'aucun écran).
+
+## Deux canaux, une même file
+- **canal DOM** (config `source` = dom ou dom+api) : Messenger personnel, lu via le
+  navigateur. L'API officielle Meta ne couvre PAS les Messenger personnels — seule
+  surface officielle : les messages d'une Page.
+- **canal API officielle** (source = api ou dom+api) : messages de la Page Facebook, lus
+  par `api-scan` via le Graph API (`/{page}/conversations`), réponses envoyées par
+  `POST /{page}/messages`. Zéro écran, zéro navigateur : fonctionne même navigateur
+  fermé. Nécessite `fb_page_id` + `fb_page_token` (secret) dans les réglages du plugin.
+- Le canal API suit exactement les mêmes règles, mêmes portes (heures, plafond, mode
+  d'envoi, liste blanche) et la même file que le canal DOM. Chaque entrée api porte
+  `channel: "api"` et `psid` : un `send --pending p-XXXX` route tout seul vers l'API —
+  et refusera si la fenêtre de 24 h de Meta est fermée (porte Meta, non contournable).
 
 ## Qui fait quoi
-- **watch** (cron auto `fb-guardian-watcher`, ~3 min, ZÉRO token au repos) : scanne, notifie,
-  envoie les réponses modèles, met en file. Il ne réveille l'agent QUE si sa sortie contient
-  une ligne `[cron-agent]` : nouvelles réponses IA en attente (`await_ai`) ou scan
-  `dom_changed`. Sinon silence total : aucune passe d'agent, aucun message.
-- **l'agent** (réveillé à la demande par la ligne `[cron-agent]`, qui donne la session
-  d'écran) : ne traite QUE les `await_ai` (rédaction IA, photos à router) ou un diagnostic
-  `dom_changed`. Chaque entrée se termine par
-  `queue --set-text <id> "<réponse>"` (brouillon à approuver), un envoi `send --pending`,
-  ou `queue --done <id>` (traitée ou hors périmètre) — JAMAIS laissée
+- **watch** (cron auto `fb-guardian-watcher`, ~3 min, ZÉRO token au repos) : lance les
+  passes des canaux actifs, notifie, envoie les réponses modèles, met en file. Il ne
+  réveille l'agent QUE si sa sortie contient une ligne `[cron-agent]` : nouvelles
+  réponses IA en attente (`await_ai`), scan `dom_changed`, ou échec api (1
+  diagnostic/jour max). Sinon silence total : aucune passe d'agent, aucun message.
+- **l'agent** (réveillé à la demande par la ligne `[cron-agent]`) : ne traite QUE les
+  `await_ai` (rédaction IA, photos à router) ou un diagnostic. Chaque entrée se termine
+  par `queue --set-text <id> "<réponse>"` (brouillon à approuver), un envoi
+  `send --pending`, ou `queue --done <id>` (traitée ou hors périmètre) — JAMAIS laissée
   ouverte. Une même entrée n'est réveillée que 3 fois ; ensuite c'est une notification
   « file bloquée », pas un nouveau réveil.
 - **Ignorer en silence** : un message qui ne correspond à aucune règle, qui est un doublon
@@ -95,35 +137,46 @@ par défaut. Premier match (priorité croissante) gagne. Une règle : qui (`send
   (mode d'envoi, liste blanche, heures, plafond) le permettent, sinon brouillon ;
 - `notify` — notification personnalisée au lieu d'une réponse ;
 - `save_photo_to` — nom d'un projet open-bot : les photos du fil partent dans
-  `~/workspace/<projet>/fb-guardian/` (tâche `route_photo` pour l'agent).
+  `~/workspace/<projet>/fb-guardian/` (tâche `route_photo` pour l'agent). Sur le canal
+  api, la photo vit dans l'inbox de la Page (Business Suite) : y aller ou skipper.
 Commandes : `--list`, `--add --sender X --contains "a,b" --photo --reply "..." / --notify "..." / --save-photo projet [--priority N]`,
 `--enable|--disable|--remove ID`, `--test --sender X --text "aperçu"`.
 Pour éditer à la main : le JSON est un simple tableau de règles, un objet par règle.
 
 ## Règles permanentes
 - Jamais de mot de passe : reconnecter l'utilisateur est une action humaine sur l'écran du bureau.
-- Jamais deux réponses au même message : le registre du scan fait foi.
+- Jamais deux réponses au même message : le registre du scan fait foi (canal DOM : aperçu
+  normalisé ; canal api : id de message Meta, dédoublonnage exact).
 - En envoi direct, l'expéditeur doit être sur la liste blanche ; sinon brouillon + approbation.
 - Le plafond quotidien et les heures actives sont des portes DURES : même `--force` ne les contourne pas.
+- La fenêtre de messagerie de 24 h de Meta est une porte du canal api : au-delà, refus clair.
 - Les brouillons partent seulement après le oui explicite de l'utilisateur (« envoie p-XXXX »).
 - Passes sans travail = silence : ne jamais commenter un cycle où il n'y avait rien à faire,
   et ne jamais détailler les messages ignorés — ils n'existent pas pour l'utilisateur.
 
 ## Commandes utiles
-- Scan + plan : `ob-plugin-fb-message-guardian-scan --session S` (`--force` ignore l'intervalle)
-- Contexte d'un fil pour rédiger : `...-scan --session S --thread "Nom"`
+- Scan DOM + plan : `ob-plugin-fb-message-guardian-scan --session S` (`--force` ignore l'intervalle)
+- Scan API + plan : `ob-plugin-fb-message-guardian-api-scan` (aucun écran requis)
+- Contexte d'un fil DOM pour rédiger : `...-scan --session S --thread "Nom"` (canal api :
+  relire la conversation via le Graph API si besoin de contexte)
 - File d'attente : `...-queue --list` (n'expose que les entrées ouvertes en `open[]`),
   `--approve p-XXXX`, `--set-text p-XXXX "texte"` (brouillon), `--done p-XXXX` (traitée),
   `--skip p-XXXX "raison"` (doublon)
 - Envoi d'un brouillon approuvé : `...-send --session S --pending p-XXXX`
-- Envoi direct demandé par l'utilisateur : `...-send --session S --to "Nom" --text "..." --force`
-- Veille manuelle : `...-watch` (une passe scriptée, silence si rien de neuf)
+  (le canal — DOM ou API — est choisi par l'entrée elle-même)
+- Envoi direct demandé par l'utilisateur : DOM `...-send --session S --to "Nom" --text "..." --force`,
+  API `...-send --psid PSID --to "Nom" --text "..."`
+- Veille manuelle : `...-watch` (une passe scriptée des canaux actifs, silence si rien de neuf)
 
-## Statuts du scan
-`too_soon` (intervalle pas écoulé), `ok` (plan dans `new[]` + `await_ai`), `not_logged_in`/`needs_user`
-(session fermée ou écran à rendre — notifier, ne pas retenter), `dom_changed`/`error`
-(sélecteurs à réparer : Facebook a changé son DOM — réparer parse_rows/parse_row dans le scan).
-Les aperçus e2ee sans texte (« chiffrement… ») et les groupes sont ignorés faute d'aperçu lisible.
+## Statuts des scans
+DOM : `too_soon` (intervalle pas écoulé), `ok` (plan dans `new[]` + `await_ai`),
+`not_logged_in`/`needs_user` (session fermée ou écran à rendre — notifier, ne pas
+retenter), `dom_changed`/`error` (sélecteurs à réparer : Facebook a changé son DOM —
+réparer parse_rows/parse_row dans le scan). Les aperçus e2ee sans texte (« chiffrement… »)
+et les groupes sont ignorés faute d'aperçu lisible.
+API : `disabled` (source=dom), `unconfigured` (fb_page_id/fb_page_token manquants),
+`api_error` (token expiré, permissions, réseau — le detail dit quoi), `ok`. Un échec api
+ne réveille l'agent qu'une fois par jour.
 """
 
 # Déduplique les configs par clé (les builds répétés étendaient la liste sans vérifier).

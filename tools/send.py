@@ -5,12 +5,46 @@ Le tap se fait via ob-vnc (clic dans le composer, collage, Entrée) car le compo
 exposé dans l'arbre accessible retourné par ob-page."""
 import argparse, json, os, re, subprocess, sys, time
 from datetime import datetime
+from urllib.request import Request, urlopen
 
 PLUGIN_ID = "fb-message-guardian"
 SETTINGS_PATH = os.path.expanduser("~/.config/open-bot/plugin-%s.json" % PLUGIN_ID)
 STATE_PATH = os.path.expanduser("~/.open-bot/%s/state.json" % PLUGIN_ID)
 INBOX_URL = "https://www.messenger.com/"
 SIDEBAR_W = 380
+GRAPH_BASE = os.environ.get("FBGUARD_GRAPH_BASE", "https://graph.facebook.com").rstrip("/")
+DEFAULT_GRAPH_VERSION = "v21.0"
+
+def api_send(psid, text, timeout=25):
+    """Envoi par l'API officielle Meta (POST /{page}/messages). Retourne (ok, detail)."""
+    settings = {}
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as f:
+            settings = json.load(f).get("settings", {})
+    except Exception:
+        pass
+    page_id = (settings.get("fb_page_id") or "").strip()
+    token = (settings.get("fb_page_token") or "").strip()
+    version = (settings.get("api_graph_version") or DEFAULT_GRAPH_VERSION).strip()
+    if not page_id or not token:
+        return False, "api non configurée : fb_page_id et fb_page_token requis"
+    body = json.dumps({"recipient": {"id": psid}, "message": {"text": text},
+                       "messaging_type": "RESPONSE"}).encode("utf-8")
+    url = "%s/%s/%s/messages?%s" % (GRAPH_BASE, version, page_id,
+                                    "access_token=" + token)
+    try:
+        with urlopen(Request(url, data=body, method="POST",
+                             headers={"Content-Type": "application/json"}), timeout=timeout) as r:
+            resp = json.loads(r.read().decode("utf-8"))
+        return True, "message_id %s" % ((resp.get("message_id") or "?"),)
+    except Exception as e:
+        detail = str(e)[:200]
+        try:
+            err = json.loads(e.read().decode("utf-8")).get("error") or {}
+            detail = "%s %s" % (err.get("code", ""), err.get("message", "")[:180])
+        except Exception:
+            pass
+        return False, detail
 
 def out(obj, code=0):
     print(json.dumps(obj, ensure_ascii=False)); sys.exit(code)
@@ -107,23 +141,32 @@ def send_via_composer(session, text):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--session", required=True)
+    ap.add_argument("--session", default="", help="id d'écran (requis pour le canal DOM ; inutile via --psid)")
     ap.add_argument("--to", metavar="NOM")
     ap.add_argument("--text", metavar="TEXTE")
     ap.add_argument("--pending", metavar="ID", help="approuver et envoyer un brouillon en attente")
+    ap.add_argument("--psid", metavar="PSID", help="envoi direct par l'API Page (canal api, sans écran)")
     ap.add_argument("--force", action="store_true", help="envoi sur demande explicite de l'utilisateur (contourne mode/liste blanche, jamais le plafond)")
     args = ap.parse_args()
 
     settings, state = load()
-    sender, text = args.to, args.text
+    sender, text, psid = args.to, args.text, args.psid
     pid = None
     if args.pending:
         entry = next((p for p in state["pending"] if p["id"] == args.pending), None)
         if not entry:
             out({"status": "error", "detail": "brouillon introuvable : " + args.pending}, 2)
         sender, text, pid = entry["sender"], entry["text"], entry["id"]
+        if entry.get("channel") == "api":
+            psid = entry.get("psid") or psid
+            if not entry.get("window_open") and not args.force:
+                out({"status": "refused",
+                     "reason": "fenêtre de 24 h Meta fermée sur ce fil : répondre depuis la boîte Page à la main"}, 2)
     if not sender or not text:
         out({"status": "error", "detail": "--to et --text requis (ou --pending ID)"}, 2)
+    api_mode = bool(psid)  # canal API officiel dès qu'un PSID est fourni
+    if args.psid and not psid:
+        out({"status": "error", "detail": "--psid exigé pour un envoi API direct"}, 2)
 
     if not args.force:
         block = gates(settings, state, sender)
@@ -139,6 +182,26 @@ def main():
         out({"status": "refused",
              "reason": "réponse identique déjà envoyée à ce destinataire (jamais deux réponses au même message ; --force pour passer)"}, 2)
 
+    # le placeholder part JAMAIS brut : expansion au moment de l'envoi (les deux canaux)
+    text = text.replace("{expediteur}", (sender or "").split()[0] if sender else "")
+
+    if api_mode:
+        ok, detail = api_send(psid, text)
+        if not ok:
+            out({"status": "send_failed", "detail": "envoi API refusé : " + detail}, 2)
+        today = datetime.now().strftime("%Y-%m-%d")
+        state["sends"][today] = state.get("sends", {}).get(today, 0) + 1
+        state.setdefault("sent_log", []).append({"ts": datetime.now().isoformat(timespec="seconds"),
+                                                 "sender": sender, "text": text[:200],
+                                                 "channel": "api", "pending": pid})
+        if pid:
+            state["pending"] = [p for p in state["pending"] if p["id"] != pid]
+        save(state)
+        out({"status": "sent", "channel": "api", "to": sender, "psid": psid,
+             "chars": len(text), "sent_today": state["sends"][today]})
+
+    if not args.session:
+        out({"status": "error", "detail": "--session requis pour l'envoi DOM (inutile avec --psid)"}, 2)
     thread_page, _ = open_thread(args.session, sender)
     if thread_page is None:
         out({"status": "error", "detail": "conversation introuvable : " + sender}, 2)
