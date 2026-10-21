@@ -15,6 +15,7 @@ LOGIN_MARKERS = ("se connecter", "mot de passe", "adresse électronique", "find 
 E2EE_PLACEHOLDER = "chiffrement"
 PHOTO_HINTS = ("photo", "\U0001F4F7")  # aperçus Messenger : « a envoyé une photo » / 📷
 
+
 def out(obj, code=0):
     print(json.dumps(obj, ensure_ascii=False))
     sys.exit(code)

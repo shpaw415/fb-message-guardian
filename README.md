@@ -71,12 +71,19 @@ Un script pur, sans IA :
   notification. Tu approuves en disant **« envoie p-XXXX »** dans n'importe quel fil.
 - **Notifications** : rien n'est envoyé ; tu es juste informé.
 
-### Étape 3 — L'envoi (`ob-plugin-fb-message-guardian-send`)
+### Étape 3 — L'envoi (`ob-plugin-fb-message-guardian-send`, v0.3.3)
 
-Le composer Messenger n'est pas exposé dans l'arbre accessible du navigateur (~24 éléments
-visibles seulement). L'envoi passe donc par la voie pixels : clic dans le composer,
-collage du texte, Entrée, puis **confirmation** en relisant l'aperçu de la conversation
-(il doit passer à `Vous: <texte>`). 3 essais, sinon échec propre avec rapport.
+Le composer e2ee est un contenteditable que le read DOM affiche toujours vide. L'envoi
+passe donc par ob-vnc, mais en **collages courts accumulés** : focus par clic DOM sur le
+textbox « Écrire à <nom> », collages de ≤ ~280 car (au-delà, le collage tronque à
+~310 car et perd les emojis), chacun **vérifié par capture** (juge ob-system1) avant le
+suivant — puis **UN SEUL Return par bloc de ≤ 1200 car** : le destinataire reçoit UN
+message, pas une pile de bulles. Confirmation sur le TEXTE INTÉGRAL de chaque bloc — un
+aperçu tronqué ou la seule carte d'un lien ne prouvent rien (faux « sent » du
+2026-10-21). Un collage ou un bloc non confirmé → `send_failed`, blocs restants non
+envoyés, brouillon conservé, composer laissé vide (jamais de fragment) ; ctrl-a
+uniquement quand la capture a prouvé que le focus est dans le composer (sinon :
+sélection multiple des messages).
 
 ---
 
@@ -255,8 +262,11 @@ tu parles du plugin dans un fil).
 - Seules les ~7 premières conversations de la barre latérale sont lues (limite de la
   fenêtre accessible du navigateur). Les demandes de messages (2 non lus à l'installation)
   ne sont pas encore scannées — compteur visible seulement.
-- L'envoi dépend des pixels (composer non exposé) : si la mise en page change beaucoup,
-  le send peut échouer et le rapporter proprement.
+- L'envoi DOM dépend du navigateur (composer e2ee peu pilotable) : depuis v0.3.2, textes
+  longs partis en segments de ≤ ~280 car vérifiés par capture avant chaque Entrée et
+  confirmés sur le texte intégral ; les emojis sont retirés du canal DOM (le collage les
+  perd — le canal API, lui, les conserve) ; si la mise en page change beaucoup, le send
+  échoue proprement (`send_failed`, brouillon conservé).
 - Un seul cron pilote désormais le plugin : `fb-guardian-watcher` en mode **auto** (le
   script tourne toutes les 3 min et ne réveille l'agent que par une ligne `[cron-agent]`).
   L'ancien cron prompt 15 min (`plugin:fb-message-guardian:scan-inbox`) n'existe plus et

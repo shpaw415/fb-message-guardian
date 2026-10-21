@@ -11,8 +11,6 @@ def tool(name, path):
 with open(os.path.join(BASE, "open-bot.plugin.json"), encoding="utf-8") as f:
     m = json.load(f)
 
-# Version 0.2.0 : ajout du canal API officielle Meta (messages de la Page).
-m["version"] = "0.2.0"
 m["configs"][0]["label"] = ("Mode de réponse : hybride (modèle si mot-clé, IA sinon), "
                             "auto (modèles + notifications) ou ia (tout rédigé par l'IA)")
 m["tools"] = [
@@ -167,6 +165,42 @@ Pour éditer à la main : le JSON est un simple tableau de règles, un objet par
 - Envoi direct demandé par l'utilisateur : DOM `...-send --session S --to "Nom" --text "..." --force`,
   API `...-send --psid PSID --to "Nom" --text "..."`
 - Veille manuelle : `...-watch` (une passe scriptée des canaux actifs, silence si rien de neuf)
+
+## Échec d'envoi (send_failed) — procédure de repli obligatoire
+Un `send` DOM qui finit en `send_failed` suit CETTE procédure, sans exception — quel que
+soit l'état du send DOM. Depuis v0.3.3 le send accumule lui-même des collages courts
+(≤ ~280 car, vérifiés par capture après chacun) puis presse UN SEUL Return par bloc de
+≤ ~1200 car — le destinataire reçoit UN message. Il vérifie le composer PAR CAPTURE
+(le read d'un contenteditable e2ee renvoie toujours value="") et ne confirme « sent »
+que sur le TEXTE INTÉGRAL du bloc — jamais sur l'aperçu d'un lien ; un échec doit
+rester rare et le brouillon reste en file.
+- **Jamais plus de 4 essais** : l'outil plafonne déjà ses essais internes ; l'agent ne
+  relance JAMAIS la boucle send au-delà. Un seul repli manuel, celui ci-dessous.
+- **Dès le send_failed** : vérifier par CAPTURE qu'AUCUN fragment ne reste dans le
+  composer ni dans le fil (aucun aperçu « Vous: <texte> » partiel) — avant tout
+  signalement. JAMAIS de ctrl-a tant que la capture n'a pas prouvé que le focus est
+  dans le composer : ctrl-a hors composer déclenche la sélection multiple des messages
+  (bordure pointillée + pilule « Échap » ; Escape clavier et reload n'en sortent pas).
+- **Fil e2ee messenger.com** : le composer est un contenteditable « Écrire à <nom> »
+  dont le `ob-page read` affiche TOUJOURS `value=""`, même rempli. Le contenu se
+  vérifie par capture ob-vnc (juge `ob-system1 --image`), JAMAIS par le read.
+- **Repli validé** (unique procédure acceptée) :
+  1. focus par `ob-page click <id du textbox « Écrire à <nom> »>` — ce clic DOM DONNE
+     le focus clavier (constat 2026-10-21) ; le clic pixel (~y=H-50) reste incertain :
+     il peut tomber sur une rangée de message et ouvrir la sélection multiple ;
+  2. des `ob-vnc paste "<texte>"` de ≤ ~300 car chacun (au-delà le collage TRONQUE à
+     ~310 car et perd les emojis — constat 2026-10-21), ACCUMULÉS dans le composer ;
+     texte en PARAGRAPHE UNIQUE (le collage aplatit les sauts de ligne) ; les emojis
+     sont perdus au collage ;
+  3. vérification par capture (juge ob-system1) APRÈS CHAQUE collage, puis UN SEUL
+     `ob-vnc key Return` quand le composer affiche l'intégralité (≤ ~1200 car ; au-delà,
+     un Return par bloc) ;
+  4. confirmation de CHAQUE message envoyé sur son TEXTE INTÉGRAL : aperçu
+     « Vous: <texte> » ou bulle « Message envoyé … par Vous : <texte> » — un aperçu
+     tronqué ou la seule carte de lien ne prouvent RIEN (faux « sent » du 2026-10-21).
+- **Si le repli échoue aussi** : vider le composer (focus prouvé seulement), revérifier
+  qu'aucun fragment n'est parti, et seulement alors signaler l'échec — brouillon
+  conservé dans la file, jamais d'essai à l'aveugle, jamais de fragment laissé.
 
 ## Statuts des scans
 DOM : `too_soon` (intervalle pas écoulé), `ok` (plan dans `new[]` + `await_ai`),

@@ -24,6 +24,7 @@ MESSAGES_PER_THREAD = 5      # fenêtre de rattrapage par conversation
 CONV_LIMIT = 25
 SEEN_KEEP = 20               # mids conservés par conversation pour le dédoublonnage
 
+
 def out(obj, code=0):
     print(json.dumps(obj, ensure_ascii=False))
     sys.exit(code)
