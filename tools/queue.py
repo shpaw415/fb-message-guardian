@@ -66,7 +66,7 @@ def main():
         e["drafted_at"] = datetime.now().isoformat(timespec="seconds")
         save(d)
         out({"status": "drafted", "id": rid, "sender": e.get("sender"),
-             "hint": "notifie Justin : brouillon %s pour %s — approuve par « envoie %s »"
+             "hint": "notifie l'utilisateur : brouillon %s pour %s — approuve par « envoie %s »"
                      % (rid, e.get("sender"), rid)})
     if args.approve:
         e = next((p for p in d["pending"] if p["id"] == args.approve), None)
